@@ -118,6 +118,9 @@ impl TestRunner {
             #[cfg(feature = "liquid")]
             parent_network: bitcoin::Network::Regtest,
             initial_sync_compaction: false,
+            db_block_cache_mb: 8,
+            db_parallelism: 2,
+            db_write_buffer_size_mb: 256,
             //#[cfg(feature = "electrum-discovery")]
             //electrum_public_hosts: Option<crate::electrum::ServerHosts>,
             //#[cfg(feature = "electrum-discovery")]
@@ -141,7 +144,7 @@ impl TestRunner {
             &metrics,
         )?);
 
-        let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config));
+        let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config, &metrics));
 
         let fetch_from = if !env::var("JSONRPC_IMPORT").is_ok() && !cfg!(feature = "liquid") {
             // run the initial indexing from the blk files then switch to using the jsonrpc,
