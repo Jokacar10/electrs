@@ -1040,7 +1040,7 @@ fn test_rest_reorg() -> Result<()> {
 }
 
 // bitcoin 28.0 only tests - submitpackage
-#[cfg(all(not(feature = "liquid"), feature = "bitcoind_28_0"))]
+#[cfg(not(feature = "liquid"))]
 #[test]
 fn test_rest_submit_package() -> Result<()> {
     let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
