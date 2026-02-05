@@ -18,8 +18,8 @@ use elements::{
 };
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::convert::TryInto;
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use crate::{chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
@@ -58,16 +58,18 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open(path: &Path, config: &Config, metrics: &Metrics) -> Self {
-        let txstore_db = DB::open(&path.join("txstore"), config);
+    pub fn open(config: &Config, metrics: &Metrics, verify_compat: bool) -> Self {
+        let path = config.db_path.join("newindex");
+
+        let txstore_db = DB::open(&path.join("txstore"), config, verify_compat);
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
         debug!("{} blocks were added", added_blockhashes.len());
 
-        let history_db = DB::open(&path.join("history"), config);
+        let history_db = DB::open(&path.join("history"), config, verify_compat);
         let indexed_blockhashes = load_blockhashes(&history_db, &BlockRow::done_filter());
         debug!("{} blocks were indexed", indexed_blockhashes.len());
 
-        let cache_db = DB::open(&path.join("cache"), config);
+        let cache_db = DB::open(&path.join("cache"), config, verify_compat);
 
         let db_metrics = Arc::new(RocksDbMetrics::new(&metrics));
         txstore_db.start_stats_exporter(Arc::clone(&db_metrics), "txstore_db");
@@ -75,8 +77,21 @@ impl Store {
         cache_db.start_stats_exporter(Arc::clone(&db_metrics), "cache_db");
 
         let headers = if let Some(tip_hash) = txstore_db.get(b"t") {
-            let tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");
+            let mut tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");
             let headers_map = load_blockheaders(&txstore_db);
+
+            // Move the tip back until we reach a block that is indexed in the history db.
+            // It is possible for the tip recorded under the db "t" key to be un-indexed if electrs
+            // shuts down during reorg handling. Normally this wouldn't matter because the non-indexed
+            // block would be stale, but it could matter if the chain later re-orged back to
+            // include the previously stale block because more blocks were built on top of it.
+            // Without this, the stale-then-not-stale block(s) would not get re-indexed correctly.
+            while !indexed_blockhashes.contains(&tip_hash) {
+                tip_hash = headers_map
+                    .get(&tip_hash)
+                    .expect("invalid header chain")
+                    .prev_blockhash;
+            }
             debug!(
                 "{} headers were loaded, tip at {:?}",
                 headers_map.len(),
@@ -107,6 +122,10 @@ impl Store {
 
     pub fn cache_db(&self) -> &DB {
         &self.cache_db
+    }
+
+    pub fn headers(&self) -> RwLockReadGuard<HeaderList> {
+        self.indexed_headers.read().unwrap()
     }
 
     pub fn done_initial_sync(&self) -> bool {
@@ -259,22 +278,62 @@ impl Indexer {
         db.enable_auto_compaction();
     }
 
-    fn get_new_headers(&self, daemon: &Daemon, tip: &BlockHash) -> Result<Vec<HeaderEntry>> {
-        let headers = self.store.indexed_headers.read().unwrap();
-        let new_headers = daemon.get_new_headers(&headers, &tip)?;
-        let result = headers.order(new_headers);
+    fn get_new_headers(
+        &self,
+        daemon: &Daemon,
+        tip: &BlockHash,
+    ) -> Result<(Vec<HeaderEntry>, Option<usize>)> {
+        let indexed_headers = self.store.indexed_headers.read().unwrap();
+        let raw_new_headers = daemon.get_new_headers(&indexed_headers, tip)?;
+        let (new_headers, reorged_since) = indexed_headers.preprocess(raw_new_headers, tip);
 
-        if let Some(tip) = result.last() {
-            info!("{:?} ({} left to index)", tip, result.len());
-        };
-        Ok(result)
+        if let Some(tip) = new_headers.last() {
+            info!("{:?} ({} left to index)", tip, new_headers.len());
+        }
+        Ok((new_headers, reorged_since))
     }
 
     pub fn update(&mut self, daemon: &Daemon) -> Result<BlockHash> {
         let daemon = daemon.reconnect()?;
         let tip = daemon.getbestblockhash()?;
-        let new_headers = self.get_new_headers(&daemon, &tip)?;
 
+        let (new_headers, reorged_since) = self.get_new_headers(&daemon, &tip)?;
+
+        // Handle reorgs by undoing the reorged (stale) blocks first
+        if let Some(reorged_since) = reorged_since {
+            // Remove reorged headers from the in-memory HeaderList.
+            // This will also immediately invalidate all the history db entries originating from those blocks
+            // (even before the rows are deleted below), since they reference block heights that will no longer exist.
+            // This ensures consistency - it is not possible for blocks to be available (e.g. in GET /blocks/tip or /block/:hash)
+            // without the corresponding history entries for these blocks (e.g. in GET /address/:address/txs), or vice-versa.
+            let mut reorged_headers = self
+                .store
+                .indexed_headers
+                .write()
+                .unwrap()
+                .pop(reorged_since);
+            // The chain tip will temporarily drop to the common ancestor (at height reorged_since-1),
+            // until the new headers are `append()`ed (below).
+
+            info!(
+                "processing reorg of depth {} since height {}",
+                reorged_headers.len(),
+                reorged_since,
+            );
+
+            // Reorged blocks are undone in chunks of 100, processed in serial, each as an atomic batch.
+            // Reverse them so that chunks closest to the chain tip are processed first,
+            // which is necessary to properly recover from crashes during reorg handling.
+            // Also see the comment under `Store::open()`.
+            reorged_headers.reverse();
+
+            // Fetch the reorged blocks, then undo their history index db rows.
+            // The txstore db rows are kept for reorged blocks/transactions.
+            start_fetcher(self.from, &daemon, reorged_headers)?
+                .map(|blocks| self.undo_index(&blocks));
+        }
+
+        // Add new blocks to the txstore db
         let to_add = self.headers_to_add(&new_headers);
         debug!(
             "adding transactions from {} blocks using {:?}",
@@ -303,6 +362,7 @@ impl Indexer {
 
         self.start_auto_compactions(&self.store.txstore_db);
 
+        // Index new blocks to the history db
         let to_index = self.headers_to_index(&new_headers);
         debug!(
             "indexing history from {} blocks using {:?}",
@@ -320,19 +380,21 @@ impl Indexer {
             self.flush = DBFlush::Enable;
         }
 
-        // update the synced tip *after* the new data is flushed to disk
+        // Update the synced tip after all db writes are flushed
         debug!("updating synced tip to {:?}", tip);
         self.store.txstore_db.put_sync(b"t", &serialize(&tip));
 
+        // Finally, append the new headers to the in-memory HeaderList.
+        // This will make both the headers and the history entries visible in the public APIs, consistently with each-other.
         let mut headers = self.store.indexed_headers.write().unwrap();
-        headers.apply(new_headers);
+        headers.append(new_headers);
         assert_eq!(tip, *headers.tip());
 
         if let FetchFrom::BlkFiles = self.from {
             self.from = FetchFrom::Bitcoind;
         }
 
-        self.tip_metric.set(headers.len() as i64 - 1);
+        self.tip_metric.set(headers.best_height() as i64);
 
         Ok(tip)
     }
@@ -345,7 +407,7 @@ impl Indexer {
         };
         {
             let _timer = self.start_timer("add_write");
-            self.store.txstore_db.write(rows, self.flush);
+            self.store.txstore_db.write_rows(rows, self.flush);
         }
 
         self.store
@@ -356,6 +418,37 @@ impl Indexer {
     }
 
     fn index(&self, blocks: &[BlockEntry]) {
+        self.store
+            .history_db
+            .write_rows(self._index(blocks), self.flush);
+
+        let mut indexed_blockhashes = self.store.indexed_blockhashes.write().unwrap();
+        indexed_blockhashes.extend(blocks.iter().map(|b| b.entry.hash()));
+    }
+
+    // Undo the history db entries previously written for the given blocks (that were reorged).
+    // This includes the TxHistory, TxEdge, TxConf and BlockDone rows ('H', 'S', 'C' and 'D'),
+    // as well as the Elements history rows ('I' and 'i').
+    //
+    // This does *not* remove any txstore db entries, which are intentionally kept
+    // even for reorged blocks.
+    fn undo_index(&self, blocks: &[BlockEntry]) {
+        self.store
+            .history_db
+            .delete_rows(self._index(blocks), self.flush);
+        // Note this doesn't actually "undo" the rows - the keys are simply deleted, and won't get
+        // reverted back to their prior value (if there was one). It is expected that the history db
+        // keys created by blocks are always unique and impossible to already exist from a prior block.
+        // This is true for all history keys (which always include the height or txid), but for example
+        // not true for the address prefix search index (in the txstore).
+
+        let mut indexed_blockhashes = self.store.indexed_blockhashes.write().unwrap();
+        for block in blocks {
+            indexed_blockhashes.remove(block.entry.hash());
+        }
+    }
+
+    fn _index(&self, blocks: &[BlockEntry]) -> Vec<DBRow> {
         let previous_txos_map = {
             let _timer = self.start_timer("index_lookup");
             lookup_txos(&self.store.txstore_db, get_previous_txos(blocks)).unwrap()
@@ -372,7 +465,7 @@ impl Indexer {
             }
             index_blocks(blocks, &previous_txos_map, &self.iconfig)
         };
-        self.store.history_db.write(rows, self.flush);
+        rows
     }
 
     pub fn fetch_from(&mut self, from: FetchFrom) {
@@ -420,6 +513,28 @@ impl ChainQuery {
         }
     }
 
+    pub fn get_block_txs(
+        &self,
+        hash: &BlockHash,
+        start_index: usize,
+        limit: usize,
+    ) -> Result<Vec<Transaction>> {
+        let txids = self.get_block_txids(hash).chain_err(|| "block not found")?;
+        ensure!(start_index < txids.len(), "start index out of range");
+
+        let txids_with_blockhash = txids
+            .into_iter()
+            .skip(start_index)
+            .take(limit)
+            .map(|txid| (txid, *hash))
+            .collect::<Vec<_>>();
+
+        self.lookup_txns(&txids_with_blockhash)
+
+        // XXX use getblock in lightmode? a single RPC call, but would fetch all txs to get one page
+        // self.daemon.getblock(hash)?.txdata.into_iter().skip(start_index).take(limit).collect()
+    }
+
     pub fn get_block_meta(&self, hash: &BlockHash) -> Option<BlockMeta> {
         let _timer = self.start_timer("get_block_meta");
 
@@ -445,17 +560,19 @@ impl ChainQuery {
             let entry = self.header_by_hash(hash)?;
             let meta = self.get_block_meta(hash)?;
             let txids = self.get_block_txids(hash)?;
+            let txids_with_blockhash: Vec<_> =
+                txids.into_iter().map(|txid| (txid, *hash)).collect();
+            let raw_txs = self.lookup_raw_txns(&txids_with_blockhash).ok()?; // TODO avoid hiding all errors as None, return a Result
 
             // Reconstruct the raw block using the header and txids,
             // as <raw header><tx count varint><raw txs>
             let mut raw = Vec::with_capacity(meta.size as usize);
 
             raw.append(&mut serialize(entry.header()));
-            raw.append(&mut serialize(&VarInt(txids.len() as u64)));
+            raw.append(&mut serialize(&VarInt(raw_txs.len() as u64)));
 
-            for txid in txids {
-                // we don't need to provide the blockhash because we know we're not in light mode
-                raw.append(&mut self.lookup_raw_txn(&txid, None)?);
+            for mut raw_tx in raw_txs {
+                raw.append(&mut raw_tx);
             }
 
             Some(raw)
@@ -514,13 +631,15 @@ impl ChainQuery {
         limit: usize,
     ) -> Vec<(Transaction, BlockId)> {
         let _timer_scan = self.start_timer("history");
-        let txs_conf = self
+        let headers = self.store.indexed_headers.read().unwrap();
+        let history_iter = self
             .history_iter_scan_reverse(code, hash)
-            .map(|row| TxHistoryRow::from_row(row).get_txid())
+            .map(TxHistoryRow::from_row)
+            .map(|row| (row.get_txid(), row.key.confirmed_height as usize))
             // XXX: unique() requires keeping an in-memory list of all txids, can we avoid that?
             .unique()
             // TODO seek directly to last seen tx without reading earlier rows
-            .skip_while(|txid| {
+            .skip_while(|(txid, _)| {
                 // skip until we reach the last_seen_txid
                 last_seen_txid.map_or(false, |last_seen_txid| last_seen_txid != txid)
             })
@@ -528,15 +647,23 @@ impl ChainQuery {
                 Some(_) => 1, // skip the last_seen_txid itself
                 None => 0,
             })
-            .filter_map(|txid| self.tx_confirming_block(&txid).map(|b| (txid, b)))
-            .take(limit)
-            .collect::<Vec<(Txid, BlockId)>>();
+            // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
+            .filter_map(|(txid, height)| Some((txid, headers.header_by_height(height)?)))
+            .take(limit);
 
-        self.lookup_txns(&txs_conf)
+        let mut txids_with_blockhash = Vec::with_capacity(limit);
+        let mut blockids = Vec::with_capacity(limit);
+        for (txid, header) in history_iter {
+            txids_with_blockhash.push((txid, *header.hash()));
+            blockids.push(BlockId::from(header));
+        }
+        drop(headers);
+
+        self.lookup_txns(&txids_with_blockhash)
             .expect("failed looking up txs in history index")
             .into_iter()
-            .zip(txs_conf)
-            .map(|(tx, (_, blockid))| (tx, blockid))
+            .zip(blockids)
+            .map(|(tx, blockid)| (tx, blockid))
             .collect()
     }
 
@@ -547,10 +674,13 @@ impl ChainQuery {
 
     fn _history_txids(&self, code: u8, hash: &[u8], limit: usize) -> Vec<(Txid, BlockId)> {
         let _timer = self.start_timer("history_txids");
+        let headers = self.store.indexed_headers.read().unwrap();
         self.history_iter_scan(code, hash, 0)
-            .map(|row| TxHistoryRow::from_row(row).get_txid())
+            .map(TxHistoryRow::from_row)
+            .map(|row| (row.get_txid(), row.key.confirmed_height as usize))
             .unique()
-            .filter_map(|txid| self.tx_confirming_block(&txid).map(|b| (txid, b)))
+            // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
+            .filter_map(|(txid, height)| Some((txid, headers.header_by_height(height)?.into())))
             .take(limit)
             .collect()
     }
@@ -582,7 +712,7 @@ impl ChainQuery {
         // save updated utxo set to cache
         if let Some(lastblock) = lastblock {
             if had_cache || processed_items > MIN_HISTORY_ITEMS_TO_CACHE {
-                self.store.cache_db.write(
+                self.store.cache_db.write_rows(
                     vec![UtxoCacheRow::new(scripthash, &newutxos, &lastblock).into_row()],
                     DBFlush::Enable,
                 );
@@ -624,12 +754,14 @@ impl ChainQuery {
         limit: usize,
     ) -> Result<(UtxoMap, Option<BlockHash>, usize)> {
         let _timer = self.start_timer("utxo_delta");
+        let headers = self.store.indexed_headers.read().unwrap();
         let history_iter = self
             .history_iter_scan(b'H', scripthash, start_height)
             .map(TxHistoryRow::from_row)
+            // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
             .filter_map(|history| {
-                self.tx_confirming_block(&history.get_txid())
-                    .map(|b| (history, b))
+                let header = headers.header_by_height(history.key.confirmed_height as usize)?;
+                Some((history, BlockId::from(header)))
             });
 
         let mut utxos = init_utxos;
@@ -685,7 +817,7 @@ impl ChainQuery {
         // save updated stats to cache
         if let Some(lastblock) = lastblock {
             if newstats.funded_txo_count + newstats.spent_txo_count > MIN_HISTORY_ITEMS_TO_CACHE {
-                self.store.cache_db.write(
+                self.store.cache_db.write_rows(
                     vec![StatsCacheRow::new(scripthash, &newstats, &lastblock).into_row()],
                     DBFlush::Enable,
                 );
@@ -702,15 +834,14 @@ impl ChainQuery {
         start_height: usize,
     ) -> (ScriptStats, Option<BlockHash>) {
         let _timer = self.start_timer("stats_delta"); // TODO: measure also the number of txns processed.
+        let headers = self.store.indexed_headers.read().unwrap();
         let history_iter = self
             .history_iter_scan(b'H', scripthash, start_height)
             .map(TxHistoryRow::from_row)
+            // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
             .filter_map(|history| {
-                self.tx_confirming_block(&history.get_txid())
-                    // drop history entries that were previously confirmed in a re-orged block and later
-                    // confirmed again at a different height
-                    .filter(|blockid| blockid.height == history.key.confirmed_height as usize)
-                    .map(|blockid| (history, blockid))
+                let header = headers.header_by_height(history.key.confirmed_height as usize)?;
+                Some((history, BlockId::from(header)))
             });
 
         let mut stats = init_stats;
@@ -765,7 +896,7 @@ impl ChainQuery {
     pub fn address_search(&self, prefix: &str, limit: usize) -> Vec<String> {
         let _timer_scan = self.start_timer("address_search");
         self.store
-            .history_db
+            .txstore_db
             .iter_scan(&addr_search_filter(prefix))
             .take(limit)
             .map(|row| std::str::from_utf8(&row.key[1..]).unwrap().to_string())
@@ -828,8 +959,9 @@ impl ChainQuery {
             .map(BlockId::from)
     }
 
+    /// Get the chain tip height. Panics if called on an empty HeaderList.
     pub fn best_height(&self) -> usize {
-        self.store.indexed_headers.read().unwrap().len() - 1
+        self.store.indexed_headers.read().unwrap().best_height()
     }
 
     pub fn best_hash(&self) -> BlockHash {
@@ -844,26 +976,40 @@ impl ChainQuery {
             .clone()
     }
 
-    // TODO: can we pass txids as a "generic iterable"?
-    // TODO: should also use a custom ThreadPoolBuilder?
-    pub fn lookup_txns(&self, txids: &[(Txid, BlockId)]) -> Result<Vec<Transaction>> {
+    pub fn lookup_txns(&self, txids: &[(Txid, BlockHash)]) -> Result<Vec<Transaction>> {
         let _timer = self.start_timer("lookup_txns");
-        txids
-            .par_iter()
-            .map(|(txid, blockid)| {
-                self.lookup_txn(txid, Some(&blockid.hash))
-                    .chain_err(|| "missing tx")
-            })
-            .collect::<Result<Vec<Transaction>>>()
+        Ok(self
+            .lookup_raw_txns(txids)?
+            .into_iter()
+            .map(|rawtx| deserialize(&rawtx).expect("failed to parse Transaction"))
+            .collect())
     }
 
     pub fn lookup_txn(&self, txid: &Txid, blockhash: Option<&BlockHash>) -> Option<Transaction> {
         let _timer = self.start_timer("lookup_txn");
-        self.lookup_raw_txn(txid, blockhash).map(|rawtx| {
-            let txn: Transaction = deserialize(&rawtx).expect("failed to parse Transaction");
-            assert_eq!(*txid, txn.compute_txid());
-            txn
-        })
+        let rawtx = self.lookup_raw_txn(txid, blockhash)?;
+        Some(deserialize(&rawtx).expect("failed to parse Transaction"))
+    }
+
+    pub fn lookup_raw_txns(&self, txids: &[(Txid, BlockHash)]) -> Result<Vec<Bytes>> {
+        let _timer = self.start_timer("lookup_raw_txns");
+        if self.light_mode {
+            txids
+                .par_iter()
+                .map(|(txid, blockhash)| {
+                    self.lookup_raw_txn(txid, Some(blockhash))
+                        .chain_err(|| "missing tx")
+                })
+                .collect()
+        } else {
+            let keys = txids.iter().map(|(txid, _)| TxRow::key(&txid[..]));
+            self.store
+                .txstore_db
+                .multi_get(keys)
+                .into_iter()
+                .map(|val| val.unwrap().chain_err(|| "missing tx"))
+                .collect()
+        }
     }
 
     pub fn lookup_raw_txn(&self, txid: &Txid, blockhash: Option<&BlockHash>) -> Option<Bytes> {
@@ -897,34 +1043,54 @@ impl ChainQuery {
 
     pub fn lookup_spend(&self, outpoint: &OutPoint) -> Option<SpendingInput> {
         let _timer = self.start_timer("lookup_spend");
+        let edge = TxEdgeValue::from_bytes(&self.store.history_db.get(&TxEdgeRow::key(outpoint))?);
+        let headers = self.store.indexed_headers.read().unwrap();
+        // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
+        let header = headers.header_by_height(edge.spending_height as usize)?;
+        Some(SpendingInput {
+            txid: deserialize(&edge.spending_txid).expect("failed to parse Txid"),
+            vin: edge.spending_vin as u32,
+            confirmed: Some(header.into()),
+        })
+    }
+
+    pub fn lookup_spends(&self, outpoints: BTreeSet<OutPoint>) -> HashMap<OutPoint, SpendingInput> {
+        let _timer = self.start_timer("lookup_spends");
+        let headers = self.store.indexed_headers.read().unwrap();
         self.store
             .history_db
-            .iter_scan(&TxEdgeRow::filter(&outpoint))
-            .map(TxEdgeRow::from_row)
-            .find_map(|edge| {
-                let txid: Txid = deserialize(&edge.key.spending_txid).unwrap();
-                self.tx_confirming_block(&txid).map(|b| SpendingInput {
-                    txid,
-                    vin: edge.key.spending_vin as u32,
-                    confirmed: Some(b),
-                })
+            .multi_get(outpoints.iter().map(TxEdgeRow::key))
+            .into_iter()
+            .zip(outpoints)
+            .filter_map(|(edge_val, outpoint)| {
+                let edge = TxEdgeValue::from_bytes(&edge_val.unwrap()?);
+                // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
+                let header = headers.header_by_height(edge.spending_height as usize)?;
+                Some((
+                    outpoint,
+                    SpendingInput {
+                        txid: deserialize(&edge.spending_txid).expect("failed to parse Txid"),
+                        vin: edge.spending_vin as u32,
+                        confirmed: Some(header.into()),
+                    },
+                ))
             })
+            .collect()
     }
 
     pub fn tx_confirming_block(&self, txid: &Txid) -> Option<BlockId> {
         let _timer = self.start_timer("tx_confirming_block");
+        let row_value = self.store.history_db.get(&TxConfRow::key(txid))?;
+        let height = TxConfRow::height_from_val(&row_value);
         let headers = self.store.indexed_headers.read().unwrap();
-        self.store
-            .txstore_db
-            .iter_scan(&TxConfRow::filter(&txid[..]))
-            .map(TxConfRow::from_row)
-            // header_by_blockhash only returns blocks that are part of the best chain,
-            // or None for orphaned blocks.
-            .filter_map(|conf| {
-                headers.header_by_blockhash(&deserialize(&conf.key.blockhash).unwrap())
-            })
-            .next()
-            .map(BlockId::from)
+        // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
+        Some(headers.header_by_height(height as usize)?.into())
+    }
+
+    pub fn lookup_confirmations(&self, txids: BTreeSet<Txid>) -> HashMap<Txid, u32> {
+        let _timer = self.start_timer("lookup_confirmations");
+        let headers = self.store.indexed_headers.read().unwrap();
+        lookup_confirmations(&self.store.history_db, headers.best_height() as u32, txids)
     }
 
     pub fn get_block_status(&self, hash: &BlockHash) -> BlockStatus {
@@ -998,7 +1164,6 @@ fn load_blockheaders(db: &DB) -> HashMap<BlockHash, BlockHeader> {
 fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRow> {
     // persist individual transactions:
     //      T{txid} → {rawtx}
-    //      C{txid}{blockhash}{height} →
     //      O{txid}{index} → {txout}
     // persist block headers', block txids' and metadata rows:
     //      B{blockhash} → {header}
@@ -1011,7 +1176,7 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
             let blockhash = full_hash(&b.entry.hash()[..]);
             let txids: Vec<Txid> = b.block.txdata.iter().map(|tx| tx.compute_txid()).collect();
             for (tx, txid) in b.block.txdata.iter().zip(txids.iter()) {
-                add_transaction(*txid, tx, blockhash, &mut rows, iconfig);
+                add_transaction(*txid, tx, &mut rows, iconfig);
             }
 
             if !iconfig.light_mode {
@@ -1027,15 +1192,7 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
         .collect()
 }
 
-fn add_transaction(
-    txid: Txid,
-    tx: &Transaction,
-    blockhash: FullHash,
-    rows: &mut Vec<DBRow>,
-    iconfig: &IndexerConfig,
-) {
-    rows.push(TxConfRow::new(txid, blockhash).into_row());
-
+fn add_transaction(txid: Txid, tx: &Transaction, rows: &mut Vec<DBRow>, iconfig: &IndexerConfig) {
     if !iconfig.light_mode {
         rows.push(TxRow::new(txid, tx).into_row());
     }
@@ -1044,6 +1201,12 @@ fn add_transaction(
     for (txo_index, txo) in tx.output.iter().enumerate() {
         if is_spendable(txo) {
             rows.push(TxOutRow::new(&txid, txo_index, txo).into_row());
+        }
+
+        if iconfig.address_search {
+            if let Some(row) = addr_search_row(&txo.script_pubkey, iconfig.network) {
+                rows.push(row);
+            }
         }
     }
 }
@@ -1082,6 +1245,23 @@ fn lookup_txo(txstore_db: &DB, outpoint: &OutPoint) -> Option<TxOut> {
         .map(|val| deserialize(&val).expect("failed to parse TxOut"))
 }
 
+pub fn lookup_confirmations(
+    history_db: &DB,
+    tip_height: u32,
+    txids: BTreeSet<Txid>,
+) -> HashMap<Txid, u32> {
+    history_db
+        .multi_get(txids.iter().map(TxConfRow::key))
+        .into_iter()
+        .zip(txids)
+        .filter_map(|(res, txid)| {
+            let confirmation_height = u32::from_le_bytes(res.unwrap()?.try_into().unwrap());
+            // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
+            (confirmation_height <= tip_height).then_some((txid, confirmation_height))
+        })
+        .collect()
+}
+
 fn index_blocks(
     block_entries: &[BlockEntry],
     previous_txos_map: &HashMap<OutPoint, TxOut>,
@@ -1110,12 +1290,17 @@ fn index_transaction(
     rows: &mut Vec<DBRow>,
     iconfig: &IndexerConfig,
 ) {
+    let txid = full_hash(&tx.compute_txid()[..]);
+
+    // persist tx confirmation row:
+    //      C{txid} → "{block_height}"
+    rows.push(TxConfRow::new(txid, confirmed_height).into_row());
+
     // persist history index:
     //      H{funding-scripthash}{funding-height}F{funding-txid:vout} → ""
     //      H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout} → ""
     // persist "edges" for fast is-this-TXO-spent check
     //      S{funding-txid:vout}{spending-txid:vin} → ""
-    let txid = full_hash(&tx.compute_txid()[..]);
     for (txo_index, txo) in tx.output.iter().enumerate() {
         if is_spendable(txo) || iconfig.index_unspendables {
             let history = TxHistoryRow::new(
@@ -1128,12 +1313,6 @@ fn index_transaction(
                 }),
             );
             rows.push(history.into_row());
-
-            if iconfig.address_search {
-                if let Some(row) = addr_search_row(&txo.script_pubkey, iconfig.network) {
-                    rows.push(row);
-                }
-            }
         }
     }
     for (txi_index, txi) in tx.input.iter().enumerate() {
@@ -1162,6 +1341,7 @@ fn index_transaction(
             txi.previous_output.vout as u16,
             txid,
             txi_index as u16,
+            confirmed_height,
         );
         rows.push(edge.into_row());
     }
@@ -1237,43 +1417,41 @@ impl TxRow {
 }
 
 #[derive(Serialize, Deserialize)]
-struct TxConfKey {
+pub struct TxConfKey {
     code: u8,
     txid: FullHash,
-    blockhash: FullHash,
 }
 
-struct TxConfRow {
+pub struct TxConfRow {
     key: TxConfKey,
+    value: u32, // the confirmation height
 }
 
 impl TxConfRow {
-    fn new(txid: Txid, blockhash: FullHash) -> TxConfRow {
-        let txid = full_hash(&txid[..]);
+    pub fn new(txid: FullHash, height: u32) -> TxConfRow {
         TxConfRow {
-            key: TxConfKey {
-                code: b'C',
-                txid,
-                blockhash,
-            },
+            key: TxConfKey { code: b'C', txid },
+            value: height,
         }
     }
 
-    fn filter(prefix: &[u8]) -> Bytes {
-        [b"C", prefix].concat()
+    pub fn key(txid: &Txid) -> Bytes {
+        bincode::serialize_little(&TxConfKey {
+            code: b'C',
+            txid: full_hash(&txid[..]),
+        })
+        .unwrap()
     }
 
-    fn into_row(self) -> DBRow {
+    pub fn into_row(self) -> DBRow {
         DBRow {
             key: bincode::serialize_little(&self.key).unwrap(),
-            value: vec![],
+            value: self.value.to_le_bytes().to_vec(),
         }
     }
 
-    fn from_row(row: DBRow) -> Self {
-        TxConfRow {
-            key: bincode::deserialize_little(&row.key).expect("failed to parse TxConfKey"),
-        }
+    fn height_from_val(val: &[u8]) -> u32 {
+        u32::from_le_bytes(val.try_into().expect("invalid TxConf value"))
     }
 }
 
@@ -1516,52 +1694,61 @@ impl TxHistoryInfo {
 }
 
 #[derive(Serialize, Deserialize)]
-struct TxEdgeKey {
+pub struct TxEdgeKey {
     code: u8,
     funding_txid: FullHash,
     funding_vout: u16,
-    spending_txid: FullHash,
-    spending_vin: u16,
 }
 
-struct TxEdgeRow {
+#[derive(Serialize, Deserialize)]
+pub struct TxEdgeValue {
+    spending_txid: FullHash,
+    spending_vin: u16,
+    spending_height: u32,
+}
+
+pub struct TxEdgeRow {
     key: TxEdgeKey,
+    value: TxEdgeValue,
 }
 
 impl TxEdgeRow {
-    fn new(
+    pub fn new(
         funding_txid: FullHash,
         funding_vout: u16,
         spending_txid: FullHash,
         spending_vin: u16,
+        spending_height: u32,
     ) -> Self {
         let key = TxEdgeKey {
             code: b'S',
             funding_txid,
             funding_vout,
+        };
+        let value = TxEdgeValue {
             spending_txid,
             spending_vin,
+            spending_height,
         };
-        TxEdgeRow { key }
+        TxEdgeRow { key, value }
     }
 
-    fn filter(outpoint: &OutPoint) -> Bytes {
-        // TODO build key without using bincode? [ b"S", &outpoint.txid[..], outpoint.vout?? ].concat()
+    fn key(outpoint: &OutPoint) -> Bytes {
         bincode::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout as u16))
             .unwrap()
     }
 
-    fn into_row(self) -> DBRow {
+    pub fn into_row(self) -> DBRow {
         DBRow {
             key: bincode::serialize_little(&self.key).unwrap(),
-            value: vec![],
+            value: bincode::serialize_little(&self.value).unwrap(),
         }
     }
+}
 
-    fn from_row(row: DBRow) -> Self {
-        TxEdgeRow {
-            key: bincode::deserialize_little(&row.key).expect("failed to deserialize TxEdgeKey"),
-        }
+impl TxEdgeValue {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        bincode::deserialize_little(bytes).expect("invalid TxEdgeValue")
     }
 }
 

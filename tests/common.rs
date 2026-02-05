@@ -144,7 +144,7 @@ impl TestRunner {
             &metrics,
         )?);
 
-        let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config, &metrics));
+        let store = Arc::new(Store::open(&config, &metrics, true));
 
         let fetch_from = if !env::var("JSONRPC_IMPORT").is_ok() && !cfg!(feature = "liquid") {
             // run the initial indexing from the blk files then switch to using the jsonrpc,
@@ -273,6 +273,18 @@ impl TestRunner {
         let mut info = client.call::<Value>("getaddressinfo", &[c_addr.to_string().into()])?;
         let uc_addr = serde_json::from_value(info["unconfidential"].take())?;
         Ok((c_addr, uc_addr))
+    }
+}
+
+// Make the RpcApi methods available directly on TestRunner,
+// without having to go through the node_client() getter
+impl bitcoincore_rpc::RpcApi for TestRunner {
+    fn call<T: for<'a> serde::de::Deserialize<'a>>(
+        &self,
+        cmd: &str,
+        args: &[serde_json::Value],
+    ) -> bitcoincore_rpc::Result<T> {
+        self.node_client().call(cmd, args)
     }
 }
 
