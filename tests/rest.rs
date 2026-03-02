@@ -1,10 +1,11 @@
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::FromHex;
-use bitcoind::bitcoincore_rpc::RpcApi;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::net;
 
+#[cfg(feature = "liquid")]
+use elementsd::bitcoincore_rpc::RpcApi;
 #[cfg(not(feature = "liquid"))]
 use {bitcoin::Amount, serde_json::from_value};
 
@@ -205,7 +206,7 @@ fn test_rest_blocks() -> Result<()> {
     let (rest_handle, rest_addr, mut tester) = common::init_rest_tester().unwrap();
 
     // Test GET /blocks/tip/hash
-    let bestblockhash = tester.node_client().get_best_block_hash()?;
+    let bestblockhash = tester.get_best_block_hash()?;
     let res = get_plain(rest_addr, "/blocks/tip/hash")?;
     assert_eq!(res, bestblockhash.to_string());
 
@@ -214,7 +215,7 @@ fn test_rest_blocks() -> Result<()> {
     assert_eq!(res, bestblockhash.to_string());
 
     // Test GET /blocks/tip/height
-    let bestblockheight = tester.node_client().get_block_count()?;
+    let bestblockheight = tester.get_block_count()?;
     let res = get_plain(rest_addr, "/blocks/tip/height")?;
     assert_eq!(
         res.parse::<u64>().expect("tip block height as an int"),
@@ -291,15 +292,13 @@ fn test_rest_block() -> Result<()> {
 
     let res = get_json(rest_addr, &format!("/block/{}", blockhash))?;
     assert_eq!(res["id"].as_str(), Some(blockhash.to_string().as_str()));
-    assert_eq!(
-        res["height"].as_u64(),
-        Some(tester.node_client().get_block_count()?)
-    );
+    assert_eq!(res["height"].as_u64(), Some(tester.get_block_count()?));
     assert_eq!(res["tx_count"].as_u64(), Some(2));
 
     // Cross-reference BlockValue fields against bitcoind's getblockheader
-    let node_header: Value =
-        tester.call("getblockheader", &[blockhash.to_string().into()])?;
+    let node_header: Value = tester
+        .node_client()
+        .call("getblockheader", &[blockhash.to_string().into()])?;
     assert_eq!(res["version"].as_u64(), node_header["version"].as_u64());
     assert_eq!(res["timestamp"].as_u64(), node_header["time"].as_u64());
     assert_eq!(
@@ -326,7 +325,7 @@ fn test_rest_block() -> Result<()> {
         .into_body()
         .read_to_vec()?;
     let node_hexblock = // uses low-level call() to support Elements
-        tester.call::<String>("getblock", &[blockhash.to_string().into(), 0.into()])?;
+        tester.node_client().call::<String>("getblock", &[blockhash.to_string().into(), 0.into()])?;
     assert_eq!(rest_rawblock, Vec::from_hex(&node_hexblock).unwrap());
 
     // Test GET /block/:hash/txs
@@ -459,7 +458,7 @@ fn test_rest_block_status() -> Result<()> {
     let blockhash1 = tester.mine()?;
     let blockhash2 = tester.mine()?; // tip
 
-    let block_count = tester.node_client().get_block_count()?;
+    let block_count = tester.get_block_count()?;
 
     // Non-tip block should have next_best pointing to next block
     let res = get_json(rest_addr, &format!("/block/{}/status", blockhash1))?;
@@ -833,7 +832,7 @@ fn test_rest_reorg() -> Result<()> {
         )
     };
 
-    let init_height = tester.node_client().get_block_count()?;
+    let init_height = tester.get_block_count()?;
 
     let address = tester.newaddress()?;
     let miner_address = tester.newaddress()?;
@@ -842,9 +841,9 @@ fn test_rest_reorg() -> Result<()> {
     let txid_b = tester.send(&address, Amount::from_sat(200000))?;
     let txid_c = tester.send(&address, Amount::from_sat(500000))?;
 
-    let tx_a = tester.get_raw_transaction(&txid_a, None)?;
-    let tx_b = tester.get_raw_transaction(&txid_b, None)?;
-    let tx_c = tester.get_raw_transaction(&txid_c, None)?;
+    let tx_a = tester.get_raw_transaction(txid_a)?;
+    let tx_b = tester.get_raw_transaction(txid_b)?;
+    let tx_c = tester.get_raw_transaction(txid_c)?;
 
     // Confirm tx_a, tx_b and tx_c
     let blockhash_1 = tester.mine()?;
@@ -877,8 +876,8 @@ fn test_rest_reorg() -> Result<()> {
     );
 
     // Reorg the last block, re-confirm tx_a at the same height
-    tester.invalidate_block(&blockhash_1)?;
-    tester.call::<Value>(
+    tester.node_client().invalidate_block(blockhash_1)?;
+    tester.node_client().call::<Value>(
         "generateblock",
         &[
             miner_address.to_string().into(),
@@ -886,7 +885,7 @@ fn test_rest_reorg() -> Result<()> {
         ],
     )?;
     // Re-confirm tx_b at a different height
-    tester.call::<Value>(
+    tester.node_client().call::<Value>(
         "generateblock",
         &[
             miner_address.to_string().into(),
@@ -956,13 +955,13 @@ fn test_rest_reorg() -> Result<()> {
     assert_eq!(c_spends["status"]["confirmed"].as_bool(), Some(false));
 
     // Test a deeper reorg, all the way back to exclude tx_b
-    tester.generate_to_address(15, &address)?;
+    tester.node_client().generate_to_address(15, &address)?;
     tester.sync()?;
-    tester.invalidate_block(&blockhash_2)?;
+    tester.node_client().invalidate_block(blockhash_2)?;
 
     for _ in 0..20 {
         // Mine some empty blocks, intentionally without tx_b
-        tester.call::<Value>(
+        tester.node_client().call::<Value>(
             "generateblock",
             &[miner_address.to_string().into(), Vec::<Value>::new().into()],
         )?;
@@ -1009,7 +1008,9 @@ fn test_rest_reorg() -> Result<()> {
     assert_eq!(c_spends["spent"].as_bool(), Some(false));
 
     // Invalidate the tip with no replacement, shortening the chain by one block
-    tester.invalidate_block(&tester.get_best_block_hash()?)?;
+    tester
+        .node_client()
+        .invalidate_block(tester.get_best_block_hash()?)?;
     tester.sync()?;
     assert_eq!(
         get_plain(rest_addr, "/blocks/tip/height")?,
@@ -1017,7 +1018,9 @@ fn test_rest_reorg() -> Result<()> {
     );
 
     // Reorg everything back to genesis
-    tester.invalidate_block(&tester.get_block_hash(1)?)?;
+    tester
+        .node_client()
+        .invalidate_block(tester.get_block_hash(1)?)?;
     tester.sync()?;
 
     assert_eq!(get_plain(rest_addr, "/blocks/tip/height")?, 0.to_string());
