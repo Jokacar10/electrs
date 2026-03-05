@@ -374,9 +374,23 @@ impl Indexer {
         self.start_auto_compactions(&self.store.cache_db);
 
         if let DBFlush::Disable = self.flush {
-            debug!("flushing to disk");
+            let t = std::time::Instant::now();
+            debug!("flushing txstore_db to disk");
             self.store.txstore_db.flush();
+            debug!("flushing txstore_db complete in {:.1?}", t.elapsed());
+
+            let t = std::time::Instant::now();
+            debug!("flushing history_db to disk");
             self.store.history_db.flush();
+            debug!("flushing history_db complete in {:.1?}", t.elapsed());
+
+            // cache_db receives WAL-disabled writes when --address-search is enabled,
+            // so it needs the same explicit flush to ensure durability.
+            let t = std::time::Instant::now();
+            debug!("flushing cache_db to disk");
+            self.store.cache_db.flush();
+            debug!("flushing cache_db complete in {:.1?}", t.elapsed());
+
             self.flush = DBFlush::Enable;
         }
 
