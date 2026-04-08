@@ -10,13 +10,14 @@ use std::time::Duration;
 use std::{env, fs, io};
 
 use base64::prelude::{Engine, BASE64_STANDARD};
+#[cfg(feature = "liquid")]
 use bitcoin::hex::FromHex;
 use error_chain::ChainedError;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use serde_json::{from_str, from_value, Value};
 
 #[cfg(not(feature = "liquid"))]
-use bitcoin::consensus::encode::{deserialize, serialize_hex};
+use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 #[cfg(feature = "liquid")]
 use elements::encode::{deserialize, serialize_hex};
 
@@ -63,23 +64,28 @@ fn header_from_value(value: Value) -> Result<BlockHeader> {
     let header_hex = value
         .as_str()
         .chain_err(|| format!("non-string header: {}", value))?;
-    let header_bytes = Vec::from_hex(header_hex).chain_err(|| "non-hex header")?;
-    Ok(
-        deserialize(&header_bytes)
-            .chain_err(|| format!("failed to parse header {}", header_hex))?,
-    )
+    deserialize_value(header_hex).chain_err(|| format!("failed to parse header {}", header_hex))
 }
 
 fn block_from_value(value: Value) -> Result<Block> {
     let block_hex = value.as_str().chain_err(|| "non-string block")?;
-    let block_bytes = Vec::from_hex(block_hex).chain_err(|| "non-hex block")?;
-    Ok(deserialize(&block_bytes).chain_err(|| format!("failed to parse block {}", block_hex))?)
+    deserialize_value(block_hex).chain_err(|| format!("failed to parse block {}", block_hex))
 }
 
 fn tx_from_value(value: Value) -> Result<Transaction> {
     let tx_hex = value.as_str().chain_err(|| "non-string tx")?;
-    let tx_bytes = Vec::from_hex(tx_hex).chain_err(|| "non-hex tx")?;
-    Ok(deserialize(&tx_bytes).chain_err(|| format!("failed to parse tx {}", tx_hex))?)
+    deserialize_value(tx_hex).chain_err(|| format!("failed to parse tx {}", tx_hex))
+}
+
+#[cfg(not(feature = "liquid"))]
+fn deserialize_value<T: bitcoin::consensus::Decodable>(hex: &str) -> Result<T> {
+    Ok(deserialize_hex(hex).chain_err(|| "failed to deserialize hex")?)
+}
+
+#[cfg(feature = "liquid")]
+fn deserialize_value<T: elements::encode::Decodable>(hex: &str) -> Result<T> {
+    let bytes = Vec::from_hex(hex).chain_err(|| "invalid hex")?;
+    Ok(deserialize(&bytes).chain_err(|| "failed to deserialize")?)
 }
 
 /// Parse JSONRPC error code, if exists.
