@@ -79,13 +79,15 @@ fn tx_from_value(value: Value) -> Result<Transaction> {
 
 #[cfg(not(feature = "liquid"))]
 fn deserialize_value<T: bitcoin::consensus::Decodable>(hex: &str) -> Result<T> {
-    Ok(deserialize_hex(hex).chain_err(|| "failed to deserialize hex")?)
+    Ok(deserialize_hex(hex)
+        .chain_err(|| format!("failed to deserialize {}", std::any::type_name::<T>()))?)
 }
 
 #[cfg(feature = "liquid")]
 fn deserialize_value<T: elements::encode::Decodable>(hex: &str) -> Result<T> {
     let bytes = Vec::from_hex(hex).chain_err(|| "invalid hex")?;
-    Ok(deserialize(&bytes).chain_err(|| "failed to deserialize")?)
+    Ok(deserialize(&bytes)
+        .chain_err(|| format!("failed to deserialize {}", std::any::type_name::<T>()))?)
 }
 
 /// Parse JSONRPC error code, if exists.
