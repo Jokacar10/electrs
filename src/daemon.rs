@@ -64,17 +64,17 @@ fn header_from_value(value: Value) -> Result<BlockHeader> {
     let header_hex = value
         .as_str()
         .chain_err(|| format!("non-string header: {}", value))?;
-    deserialize_value(header_hex).chain_err(|| format!("failed to parse header {}", header_hex))
+    deserialize_value(header_hex)
 }
 
 fn block_from_value(value: Value) -> Result<Block> {
     let block_hex = value.as_str().chain_err(|| "non-string block")?;
-    deserialize_value(block_hex).chain_err(|| format!("failed to parse block {}", block_hex))
+    deserialize_value(block_hex)
 }
 
 fn tx_from_value(value: Value) -> Result<Transaction> {
     let tx_hex = value.as_str().chain_err(|| "non-string tx")?;
-    deserialize_value(tx_hex).chain_err(|| format!("failed to parse tx {}", tx_hex))
+    deserialize_value(tx_hex)
 }
 
 #[cfg(not(feature = "liquid"))]
