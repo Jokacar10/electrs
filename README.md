@@ -15,10 +15,10 @@ Install Rust, Bitcoin Core (no `txindex` needed) and the `clang` and `cmake` pac
 ```bash
 $ git clone https://github.com/blockstream/electrs && cd electrs
 $ git checkout new-index
-$ cargo run --release --bin electrs -- -vvvv --daemon-dir ~/.bitcoin
+$ cargo run --release --bin electrs -- --daemon-dir ~/.bitcoin
 
 # Or for liquid:
-$ cargo run --features liquid --release --bin electrs -- -vvvv --network liquid --daemon-dir ~/.liquid
+$ cargo run --features liquid --release --bin electrs -- --network liquid --daemon-dir ~/.liquid
 ```
 
 See [electrs's original documentation](https://github.com/romanz/electrs/blob/master/doc/usage.md) for more detailed instructions.

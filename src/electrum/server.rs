@@ -876,7 +876,7 @@ impl RPC {
                     let salt = salt_rwlock.read().unwrap().clone();
 
                     let spawned = spawn_thread("peer", move || {
-                        info!("[{}] connected peer", addr);
+                        debug!("[{}] connected peer", addr);
                         let conn = Connection::new(
                             query,
                             stream,
@@ -890,7 +890,7 @@ impl RPC {
                             salt,
                         );
                         conn.run(receiver);
-                        info!("[{}] disconnected peer", addr);
+                        debug!("[{}] disconnected peer", addr);
                         let _ = garbage_sender.send(std::thread::current().id());
                     });
 

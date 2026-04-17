@@ -789,7 +789,7 @@ impl Daemon {
 
             result.append(&mut headers);
 
-            info!(
+            debug!(
                 "downloaded {}/{} block headers ({:.0}%)",
                 result.len(),
                 tip_height + 1,

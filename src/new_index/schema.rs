@@ -72,11 +72,11 @@ impl Store {
 
         let txstore_db = DB::open(&path.join("txstore"), config, verify_compat, &shared_cache);
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
-        debug!("{} blocks were added", added_blockhashes.len());
+        info!("{} blocks were added", added_blockhashes.len());
 
         let history_db = DB::open(&path.join("history"), config, verify_compat, &shared_cache);
         let indexed_blockhashes = load_blockhashes(&history_db, &BlockRow::done_filter());
-        debug!("{} blocks were indexed", indexed_blockhashes.len());
+        info!("{} blocks were indexed", indexed_blockhashes.len());
 
         let cache_db = DB::open(&path.join("cache"), config, verify_compat, &shared_cache);
 
@@ -101,7 +101,7 @@ impl Store {
                     .expect("invalid header chain")
                     .prev_blockhash;
             }
-            debug!(
+            info!(
                 "{} headers were loaded, tip at {:?}",
                 headers_map.len(),
                 tip_hash

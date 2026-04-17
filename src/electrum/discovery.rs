@@ -588,7 +588,7 @@ mod tests {
 
         debug!("{:#?}", discovery);
 
-        info!("{}", json!(discovery.get_servers()));
+        debug!("{}", json!(discovery.get_servers()));
 
         Ok(())
     }
