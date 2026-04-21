@@ -1987,3 +1987,23 @@ pub mod bench {
         super::add_blocks(&[data.block_entry.clone()], &data.iconfig)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_script_hash_p2pkh() {
+        // P2PKH scriptPubKey for address 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
+        // OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
+        let script: Script = Vec::from_hex("76a91462e907b15cbf27d5425399ebf6f0fb50ebb88f1888ac")
+            .unwrap()
+            .into();
+        let expected: FullHash = [
+            0x61, 0x91, 0xc3, 0xb5, 0x90, 0xbf, 0xcf, 0xa0, 0x47, 0x5e, 0x87, 0x7c, 0x30, 0x2d,
+            0xa1, 0xe3, 0x23, 0x49, 0x7a, 0xcf, 0x3b, 0x42, 0xc0, 0x8d, 0x8f, 0xa2, 0x8e, 0x36,
+            0x4e, 0xdf, 0x01, 0x8b,
+        ];
+        assert_eq!(compute_script_hash(&script), expected);
+    }
+}

@@ -115,6 +115,13 @@ struct Connection {
     salt: String,
 }
 
+fn hash_ip_with_salt(salt: &str, ip: &str) -> String {
+    let mut hasher: Sha256 = Sha256::new();
+    hasher.input(salt.as_bytes());
+    hasher.input(ip.as_bytes());
+    hasher.result_str()
+}
+
 impl Connection {
     pub fn new(
         query: Arc<Query>,
@@ -527,17 +534,10 @@ impl Connection {
         Ok(result)
     }
 
-    fn hash_ip_with_salt(&self, ip: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.input(self.salt.as_bytes());
-        hasher.input(ip.as_bytes());
-        hasher.result_str()
-    }
-
     fn log_rpc_event(&self, mut log: Value) {
         let real_ip = self.addr.ip().to_string();
         let ip_to_log = if self.rpc_logging.anonymize_ip {
-            self.hash_ip_with_salt(&real_ip)
+            hash_ip_with_salt(&self.salt, &real_ip)
         } else {
             real_ip
         };
@@ -936,5 +936,20 @@ impl Drop for RPC {
             handle.join().unwrap();
         }
         trace!("RPC server is stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hash_ip_with_salt() {
+        // SHA-256("test_salt" || "127.0.0.1")
+        let result = hash_ip_with_salt("test_salt", "127.0.0.1");
+        assert_eq!(
+            result,
+            "d474826bbd126d38bdfb1e61bf727a2d9a306ea1645071faf2638cc3891a2b30"
+        );
     }
 }
