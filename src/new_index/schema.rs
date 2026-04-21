@@ -1,10 +1,8 @@
-use bitcoin::hashes::sha256d::Hash as Sha256dHash;
+use bitcoin::hashes::{sha256, sha256d::Hash as Sha256dHash, Hash};
 use bitcoin::hex::FromHex;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
 
-use crypto::digest::Digest;
-use crypto::sha2::Sha256;
 use itertools::Itertools;
 use rayon::prelude::*;
 
@@ -1447,11 +1445,7 @@ fn addr_search_filter(prefix: &str) -> Bytes {
 pub type FullHash = [u8; 32]; // serialized SHA256 result
 
 pub fn compute_script_hash(script: &Script) -> FullHash {
-    let mut hash = FullHash::default();
-    let mut sha2 = Sha256::new();
-    sha2.input(script.as_bytes());
-    sha2.result(&mut hash);
-    hash
+    sha256::Hash::hash(script.as_bytes()).to_byte_array()
 }
 
 pub fn parse_hash(hash: &FullHash) -> Sha256dHash {
@@ -1999,11 +1993,30 @@ mod tests {
         let script: Script = Vec::from_hex("76a91462e907b15cbf27d5425399ebf6f0fb50ebb88f1888ac")
             .unwrap()
             .into();
-        let expected: FullHash = [
-            0x61, 0x91, 0xc3, 0xb5, 0x90, 0xbf, 0xcf, 0xa0, 0x47, 0x5e, 0x87, 0x7c, 0x30, 0x2d,
-            0xa1, 0xe3, 0x23, 0x49, 0x7a, 0xcf, 0x3b, 0x42, 0xc0, 0x8d, 0x8f, 0xa2, 0x8e, 0x36,
-            0x4e, 0xdf, 0x01, 0x8b,
-        ];
+        let expected = "6191c3b590bfcfa0475e877c302da1e323497acf3b42c08d8fa28e364edf018b"
+            .parse::<sha256::Hash>()
+            .unwrap()
+            .to_byte_array();
         assert_eq!(compute_script_hash(&script), expected);
+    }
+
+    #[test]
+    fn test_sha256_empty_input() {
+        // NIST SHA-256 test vector: SHA-256("")
+        let expected: sha256::Hash =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap();
+        assert_eq!(sha256::Hash::hash(b""), expected);
+    }
+
+    #[test]
+    fn test_sha256_abc() {
+        // NIST SHA-256 test vector: SHA-256("abc")
+        let expected: sha256::Hash =
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                .parse()
+                .unwrap();
+        assert_eq!(sha256::Hash::hash(b"abc"), expected);
     }
 }
