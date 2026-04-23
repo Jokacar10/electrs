@@ -6,10 +6,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Instant;
 
-use bitcoin::hashes::sha256d::Hash as Sha256dHash;
+use bitcoin::hashes::{sha256, sha256d::Hash as Sha256dHash, Hash, HashEngine};
 use bitcoin::hex::DisplayHex;
-use crypto::digest::Digest;
-use crypto::sha2::Sha256;
 use error_chain::ChainedError;
 use serde_json::{from_str, Value};
 
@@ -76,8 +74,7 @@ fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<F
     if txs.is_empty() {
         None
     } else {
-        let mut hash = FullHash::default();
-        let mut sha2 = Sha256::new();
+        let mut engine = sha256::Hash::engine();
         for (txid, blockid) in txs {
             let is_mempool = blockid.is_none();
             let has_unconfirmed_parents = is_mempool
@@ -85,10 +82,9 @@ fn get_status_hash(txs: Vec<(Txid, Option<BlockId>)>, query: &Query) -> Option<F
                 .unwrap_or(false);
             let height = get_electrum_height(blockid, has_unconfirmed_parents);
             let part = format!("{}:{}:", txid, height);
-            sha2.input(part.as_bytes());
+            engine.input(part.as_bytes());
         }
-        sha2.result(&mut hash);
-        Some(hash)
+        Some(sha256::Hash::from_engine(engine).to_byte_array())
     }
 }
 
@@ -113,6 +109,13 @@ struct Connection {
     discovery: Option<Arc<DiscoveryManager>>,
     rpc_logging: RpcLogging,
     salt: String,
+}
+
+fn hash_ip_with_salt(salt: &str, ip: &str) -> String {
+    let mut engine = sha256::Hash::engine();
+    engine.input(salt.as_bytes());
+    engine.input(ip.as_bytes());
+    format!("{:x}", sha256::Hash::from_engine(engine))
 }
 
 impl Connection {
@@ -527,17 +530,10 @@ impl Connection {
         Ok(result)
     }
 
-    fn hash_ip_with_salt(&self, ip: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.input(self.salt.as_bytes());
-        hasher.input(ip.as_bytes());
-        hasher.result_str()
-    }
-
     fn log_rpc_event(&self, mut log: Value) {
         let real_ip = self.addr.ip().to_string();
         let ip_to_log = if self.rpc_logging.anonymize_ip {
-            self.hash_ip_with_salt(&real_ip)
+            hash_ip_with_salt(&self.salt, &real_ip)
         } else {
             real_ip
         };
@@ -936,5 +932,20 @@ impl Drop for RPC {
             handle.join().unwrap();
         }
         trace!("RPC server is stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hash_ip_with_salt() {
+        // SHA-256("test_salt" || "127.0.0.1")
+        let result = hash_ip_with_salt("test_salt", "127.0.0.1");
+        assert_eq!(
+            result,
+            "d474826bbd126d38bdfb1e61bf727a2d9a306ea1645071faf2638cc3891a2b30"
+        );
     }
 }
