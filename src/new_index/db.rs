@@ -91,7 +91,7 @@ pub enum DBFlush {
 
 impl DB {
     pub fn open(path: &Path, config: &Config, verify_compat: bool, shared_cache: &rocksdb::Cache) -> DB {
-        debug!("opening DB at {:?}", path);
+        info!("opening DB at {:?}", path);
         let mut db_opts = rocksdb::Options::default();
         db_opts.create_if_missing(true);
         db_opts.set_max_open_files(100_000); // TODO: make sure to `ulimit -n` this process correctly

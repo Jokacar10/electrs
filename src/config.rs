@@ -109,7 +109,7 @@ impl Config {
                 Arg::with_name("verbosity")
                     .short("v")
                     .multiple(true)
-                    .help("Increase logging verbosity"),
+                    .help("Increase logging verbosity (default: info, -v: debug, -vv: trace)"),
             )
             .arg(
                 Arg::with_name("timestamp")
@@ -464,7 +464,9 @@ impl Config {
             .map(|s| serde_json::from_str(s).expect("invalid --electrum-public-hosts"));
 
         let mut log = stderrlog::new();
-        log.verbosity(m.occurrences_of("verbosity") as usize);
+        // Base verbosity is 2 (Info), each -v flag adds one level:
+        // no flags = Info, -v = Debug, -vv = Trace
+        log.verbosity(2 + m.occurrences_of("verbosity") as usize);
         log.timestamp(if m.is_present("timestamp") {
             stderrlog::Timestamp::Millisecond
         } else {

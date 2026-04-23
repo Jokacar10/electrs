@@ -685,7 +685,7 @@ fn handle_request(
         None => HashMap::new(),
     };
 
-    info!("handle {:?} {:?}", method, uri);
+    debug!("handle {:?} {:?}", method, uri);
     match (
         &method,
         path.get(0),

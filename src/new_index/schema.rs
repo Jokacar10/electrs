@@ -72,11 +72,11 @@ impl Store {
 
         let txstore_db = DB::open(&path.join("txstore"), config, verify_compat, &shared_cache);
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
-        debug!("{} blocks were added", added_blockhashes.len());
+        info!("{} blocks were added", added_blockhashes.len());
 
         let history_db = DB::open(&path.join("history"), config, verify_compat, &shared_cache);
         let indexed_blockhashes = load_blockhashes(&history_db, &BlockRow::done_filter());
-        debug!("{} blocks were indexed", indexed_blockhashes.len());
+        info!("{} blocks were indexed", indexed_blockhashes.len());
 
         let cache_db = DB::open(&path.join("cache"), config, verify_compat, &shared_cache);
 
@@ -101,7 +101,7 @@ impl Store {
                     .expect("invalid header chain")
                     .prev_blockhash;
             }
-            debug!(
+            info!(
                 "{} headers were loaded, tip at {:?}",
                 headers_map.len(),
                 tip_hash
@@ -429,21 +429,21 @@ impl Indexer {
 
         if let DBFlush::Disable = self.flush {
             let t = std::time::Instant::now();
-            debug!("flushing txstore_db to disk");
+            info!("flushing txstore_db to disk");
             self.store.txstore_db.flush();
-            debug!("flushing txstore_db complete in {:.1?}", t.elapsed());
+            info!("flushing txstore_db complete in {:.1?}", t.elapsed());
 
             let t = std::time::Instant::now();
-            debug!("flushing history_db to disk");
+            info!("flushing history_db to disk");
             self.store.history_db.flush();
-            debug!("flushing history_db complete in {:.1?}", t.elapsed());
+            info!("flushing history_db complete in {:.1?}", t.elapsed());
 
             // cache_db receives WAL-disabled writes when --address-search is enabled,
             // so it needs the same explicit flush to ensure durability.
             let t = std::time::Instant::now();
-            debug!("flushing cache_db to disk");
+            info!("flushing cache_db to disk");
             self.store.cache_db.flush();
-            debug!("flushing cache_db complete in {:.1?}", t.elapsed());
+            info!("flushing cache_db complete in {:.1?}", t.elapsed());
 
             self.flush = DBFlush::Enable;
         }

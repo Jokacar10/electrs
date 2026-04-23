@@ -57,10 +57,13 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
     let metrics = Metrics::new(config.monitoring_addr);
     metrics.start();
 
+    info!("starting electrs");
+
     if let Some(zmq_addr) = config.zmq_addr.as_ref() {
         zmq::start(&format!("tcp://{zmq_addr}"), block_hash_notify);
     }
 
+    info!("connecting to daemon at {}", config.daemon_rpc_addr);
     let daemon = Arc::new(Daemon::new(
         &config.daemon_dir,
         &config.blocks_dir,
@@ -71,6 +74,7 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         signal.clone(),
         &metrics,
     )?);
+    info!("opening database at {}", config.db_path.display());
     let store = Arc::new(Store::open(&config, &metrics, true));
     let mut indexer = Indexer::open(
         Arc::clone(&store),
@@ -78,7 +82,9 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         &config,
         &metrics,
     );
+    info!("starting initial sync");
     let mut tip = indexer.update(&daemon)?;
+    info!("initial sync complete, tip at {}", tip);
 
     let chain = Arc::new(ChainQuery::new(
         Arc::clone(&store),
@@ -93,6 +99,7 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         precache::precache(&chain, precache_scripthashes);
     }
 
+    info!("loading mempool");
     let mempool = Arc::new(RwLock::new(Mempool::new(
         Arc::clone(&chain),
         &metrics,
@@ -129,6 +136,8 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         &metrics,
         Arc::clone(&salt_rwlock),
     );
+
+    info!("startup complete");
 
     let main_loop_count = metrics.gauge(MetricOpts::new(
         "electrs_main_loop_count",
