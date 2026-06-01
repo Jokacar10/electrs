@@ -186,24 +186,48 @@ struct Connection {
     rx: Lines<BufReader<TcpStream>>,
     cookie_getter: Arc<dyn CookieGetter>,
     addr: SocketAddr,
+    fallback: Option<SocketAddr>,
     signal: Waiter,
 }
 
 #[trace]
-fn tcp_connect(addr: SocketAddr, signal: &Waiter) -> Result<TcpStream> {
+fn tcp_connect(
+    primary: SocketAddr,
+    fallback: Option<SocketAddr>,
+    signal: &Waiter,
+) -> Result<(TcpStream, SocketAddr)> {
     loop {
-        match TcpStream::connect_timeout(&addr, *DAEMON_CONNECTION_TIMEOUT) {
+        match TcpStream::connect_timeout(&primary, *DAEMON_CONNECTION_TIMEOUT) {
             Ok(conn) => {
                 // can only fail if DAEMON_TIMEOUT is 0
                 conn.set_read_timeout(Some(*DAEMON_READ_TIMEOUT)).unwrap();
                 conn.set_write_timeout(Some(*DAEMON_WRITE_TIMEOUT)).unwrap();
-                return Ok(conn);
+                return Ok((conn, primary));
             }
             Err(err) => {
+                let suffix = if fallback.is_some() {
+                    " (trying fallback...)"
+                } else {
+                    ""
+                };
                 warn!(
-                    "failed to connect daemon at {}: {} (backoff 3 seconds)",
-                    addr, err
+                    "failed to connect to primary daemon at {}: {}{}",
+                    primary, err, suffix
                 );
+                if let Some(fallback_addr) = fallback {
+                    match TcpStream::connect_timeout(&fallback_addr, *DAEMON_CONNECTION_TIMEOUT) {
+                        Ok(conn) => {
+                            info!("connected to fallback daemon at {}", fallback_addr);
+                            conn.set_read_timeout(Some(*DAEMON_READ_TIMEOUT)).unwrap();
+                            conn.set_write_timeout(Some(*DAEMON_WRITE_TIMEOUT)).unwrap();
+                            return Ok((conn, fallback_addr));
+                        }
+                        Err(err) => {
+                            warn!("failed to connect to fallback daemon at {}: {}", fallback_addr, err);
+                        }
+                    }
+                }
+                warn!("backoff 3 seconds before next attempt");
                 signal.wait(Duration::from_secs(3), false)?;
                 continue;
             }
@@ -215,10 +239,12 @@ impl Connection {
     #[trace]
     fn new(
         addr: SocketAddr,
+        fallback: Option<SocketAddr>,
         cookie_getter: Arc<dyn CookieGetter>,
         signal: Waiter,
     ) -> Result<Connection> {
-        let conn = tcp_connect(addr, &signal)?;
+        let (conn, active_addr) = tcp_connect(addr, fallback, &signal)?;
+        debug!("connected to bitcoind at {}", active_addr);
         let reader = BufReader::new(
             conn.try_clone()
                 .chain_err(|| format!("failed to clone {:?}", conn))?,
@@ -228,13 +254,19 @@ impl Connection {
             rx: reader.lines(),
             cookie_getter,
             addr,
+            fallback,
             signal,
         })
     }
 
     #[trace]
     fn reconnect(&self) -> Result<Connection> {
-        Connection::new(self.addr, self.cookie_getter.clone(), self.signal.clone())
+        Connection::new(
+            self.addr,
+            self.fallback,
+            self.cookie_getter.clone(),
+            self.signal.clone(),
+        )
     }
 
     #[trace]
@@ -353,6 +385,7 @@ impl Daemon {
         daemon_dir: &PathBuf,
         blocks_dir: &PathBuf,
         daemon_rpc_addr: SocketAddr,
+        daemon_rpc_fallback_addr: Option<SocketAddr>,
         daemon_parallelism: usize,
         cookie_getter: Arc<dyn CookieGetter>,
         network: Network,
@@ -365,6 +398,7 @@ impl Daemon {
             network,
             conn: Mutex::new(Connection::new(
                 daemon_rpc_addr,
+                daemon_rpc_fallback_addr,
                 cookie_getter,
                 signal.clone(),
             )?),
