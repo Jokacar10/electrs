@@ -74,6 +74,7 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         config.network_type,
         signal.clone(),
         &metrics,
+        config.daemon_conn_max_age,
     )?);
     info!("opening database at {}", config.db_path.display());
     let store = Arc::new(Store::open(&config, &metrics, true));
