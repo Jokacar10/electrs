@@ -211,6 +211,59 @@ fn test_electrum_raw() {
     assert_eq!(s, expected);
 }
 
+#[cfg_attr(not(feature = "liquid"), test)]
+#[cfg_attr(feature = "liquid", allow(dead_code))]
+fn test_electrum_jsonrpc_errors() {
+    let (_electrum_server, electrum_addr, mut _tester) = common::init_electrum_tester().unwrap();
+
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+
+    // unknown method: -32601 error reply instead of dropping the connection
+    let s = write_and_read(
+        &mut stream,
+        "{\"jsonrpc\": \"2.0\", \"method\": \"foo.bar\", \"params\": [], \"id\": 1}",
+    );
+    let expected = "{\"error\":{\"code\":-32601,\"message\":\"unknown method foo.bar\"},\"id\":1,\"jsonrpc\":\"2.0\"}";
+    assert_eq!(s, expected);
+
+    // missing param: -32602 invalid params
+    let s = write_and_read(
+        &mut stream,
+        "{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.block.header\", \"params\": [], \"id\": 2}",
+    );
+    let expected =
+        "{\"error\":{\"code\":-32602,\"message\":\"missing height\"},\"id\":2,\"jsonrpc\":\"2.0\"}";
+    assert_eq!(s, expected);
+
+    // valid JSON but not a request object: -32600 invalid request, id echoed back
+    let s = write_and_read(&mut stream, "{\"jsonrpc\": \"2.0\", \"id\": 3}");
+    let expected =
+        "{\"error\":{\"code\":-32600,\"message\":\"invalid request\"},\"id\":3,\"jsonrpc\":\"2.0\"}";
+    assert_eq!(s, expected);
+
+    // unparseable JSON: -32700 parse error with null id
+    let s = write_and_read(&mut stream, "{not json");
+    let expected =
+        "{\"error\":{\"code\":-32700,\"message\":\"parse error\"},\"id\":null,\"jsonrpc\":\"2.0\"}";
+    assert_eq!(s, expected);
+
+    // a batch with an unknown method still answers the other entries
+    let s = write_and_read(
+        &mut stream,
+        "[{\"jsonrpc\": \"2.0\", \"method\": \"server.ping\", \"id\": 4}, {\"jsonrpc\": \"2.0\", \"method\": \"foo.bar\", \"id\": 5}]",
+    );
+    let expected = "[{\"id\":4,\"jsonrpc\":\"2.0\",\"result\":null},{\"error\":{\"code\":-32601,\"message\":\"unknown method foo.bar\"},\"id\":5,\"jsonrpc\":\"2.0\"}]";
+    assert_eq!(s, expected);
+
+    // the connection survived all of the above
+    let s = write_and_read(
+        &mut stream,
+        "{\"jsonrpc\": \"2.0\", \"method\": \"server.ping\", \"id\": 6}",
+    );
+    let expected = "{\"id\":6,\"jsonrpc\":\"2.0\",\"result\":null}";
+    assert_eq!(s, expected);
+}
+
 fn write_and_read(stream: &mut TcpStream, write: &str) -> String {
     stream.write_all(write.as_bytes()).unwrap();
     stream.write(b"\n").unwrap();
