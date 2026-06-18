@@ -75,7 +75,7 @@ Additional options with the `liquid` feature:
 - `--parent-network <network>` - the parent network this chain is pegged to.
 
 Additional options with the `electrum-discovery` feature:
-- `--electrum-hosts <json>` - a json map of the public hosts where the electrum server is reachable, in the [`server.features` format](https://electrumx.readthedocs.io/en/latest/protocol-methods.html#server.features).
+- `--electrum-hosts <json>` - a json map of the public hosts where the electrum server is reachable, in the [`server.features` format](https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#server-features).
 - `--electrum-announce` - announce the electrum server on the electrum p2p server discovery network.
 
 See `$ cargo run --release --bin electrs -- --help` for the full list of options.

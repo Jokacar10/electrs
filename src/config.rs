@@ -308,7 +308,7 @@ impl Config {
         let args = args.arg(
                 Arg::with_name("electrum_public_hosts")
                     .long("electrum-public-hosts")
-                    .help("A dictionary of hosts where the Electrum server can be reached at. Required to enable server discovery. See https://electrumx.readthedocs.io/en/latest/protocol-methods.html#server-features")
+                    .help("A dictionary of hosts where the Electrum server can be reached at. Required to enable server discovery. See https://electrum-protocol.readthedocs.io/en/latest/protocol-methods.html#server-features")
                     .takes_value(true)
             ).arg(
                 Arg::with_name("electrum_announce")
