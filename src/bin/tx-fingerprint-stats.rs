@@ -40,6 +40,7 @@ fn main() {
             config.network_type,
             signal,
             &metrics,
+            config.daemon_conn_max_age,
         )
         .unwrap(),
     );

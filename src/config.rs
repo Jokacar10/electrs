@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use stderrlog;
 
 use crate::chain::Network;
@@ -27,6 +28,7 @@ pub struct Config {
     pub daemon_rpc_addr: SocketAddr,
     pub daemon_rpc_fallback_addr: Option<SocketAddr>,
     pub daemon_parallelism: usize,
+    pub daemon_conn_max_age: Option<Duration>,
     pub cookie: Option<String>,
     pub electrum_rpc_addr: SocketAddr,
     pub http_addr: SocketAddr,
@@ -176,6 +178,13 @@ impl Config {
                     .long("daemon-parallelism")
                     .help("Number of JSONRPC requests to send in parallel")
                     .default_value("4")
+            )
+            .arg(
+                Arg::with_name("daemon_rpc_conn_max_age")
+                    .long("daemon-rpc-conn-max-age")
+                    .help("Max age (in seconds) of a daemon RPC TCP connection before it is proactively recycled. Recycling re-establishes the connection, letting a load balancer (e.g. a Kubernetes ClusterSetIP) re-select a backend after node rotations. The reconnect happens inline on the next request, so prefer a generous value (minutes, not seconds) to avoid periodic latency spikes. 0 = unlimited / never recycle (default)")
+                    .default_value("0")
+                    .takes_value(true),
             )
             .arg(
                 Arg::with_name("monitoring_addr")
@@ -425,6 +434,12 @@ impl Config {
             .value_of("daemon_rpc_fallback_addr")
             .map(|e| str_to_socketaddr(e, "Bitcoin Fallback RPC"));
 
+        let daemon_conn_max_age: Option<Duration> =
+            match value_t_or_exit!(m, "daemon_rpc_conn_max_age", u64) {
+                0 => None, // 0 = unlimited / never recycle
+                secs => Some(Duration::from_secs(secs)),
+            };
+
         let electrum_rpc_addr: SocketAddr = str_to_socketaddr(
             m.value_of("electrum_rpc_addr")
                 .unwrap_or(&format!("127.0.0.1:{}", default_electrum_port)),
@@ -494,6 +509,7 @@ impl Config {
             daemon_rpc_addr,
             daemon_rpc_fallback_addr,
             daemon_parallelism: value_t_or_exit!(m, "daemon_parallelism", usize),
+            daemon_conn_max_age,
             cookie,
             utxos_limit: value_t_or_exit!(m, "utxos_limit", usize),
             electrum_rpc_addr,

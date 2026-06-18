@@ -94,6 +94,7 @@ impl TestRunner {
             db_path: electrsdb.path().to_path_buf(),
             daemon_dir: daemon_subdir.clone(),
             daemon_parallelism: 3,
+            daemon_conn_max_age: None,
             blocks_dir: daemon_subdir.join("blocks"),
             daemon_rpc_addr: params.rpc_socket.into(),
             daemon_rpc_fallback_addr: None,
@@ -145,6 +146,7 @@ impl TestRunner {
             config.network_type,
             signal.clone(),
             &metrics,
+            config.daemon_conn_max_age,
         )?);
 
         let store = Arc::new(Store::open(&config, &metrics, true));
