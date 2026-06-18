@@ -623,7 +623,7 @@ impl Connection {
             let line = value.to_string() + "\n";
             self.stream
                 .write_all(line.as_bytes())
-                .chain_err(|| format!("failed to send {}", value))?;
+                .chain_err(|| format!("failed to send response ({} bytes)", line.len()))?;
         }
         Ok(())
     }
@@ -754,11 +754,16 @@ impl Connection {
         let sender = self.sender.clone();
         let child = spawn_thread("reader", || Connection::reader_thread(reader, sender));
         if let Err(e) = self.handle_replies(receiver) {
-            error!(
-                "[{}] connection handling failed: {}",
-                self.addr,
-                e.display_chain().to_string()
-            );
+            if is_disconnect(&e) {
+                // client went away mid-exchange (broken pipe / reset) — not actionable
+                debug!("[{}] connection closed by client: {}", self.addr, e);
+            } else {
+                error!(
+                    "[{}] connection handling failed: {}",
+                    self.addr,
+                    e.display_chain().to_string()
+                );
+            }
         }
         self.stats.clients.dec();
         self.stats
@@ -773,6 +778,25 @@ impl Connection {
             error!("[{}] receiver failed: {}", self.addr, err);
         }
     }
+}
+
+/// True if the error chain is rooted in a client disconnect (broken pipe /
+/// connection reset / aborted), which is expected and shouldn't be logged as ERROR.
+fn is_disconnect(err: &Error) -> bool {
+    use std::io::ErrorKind::*;
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cause {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io_err.kind(),
+                BrokenPipe | ConnectionReset | ConnectionAborted | UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+        cause = e.source();
+    }
+    false
 }
 
 #[trace]
