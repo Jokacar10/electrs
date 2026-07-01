@@ -400,6 +400,27 @@ impl Connection {
             .collect::<Vec<_>>()))
     }
 
+    fn blockchain_scripthash_get_mempool(&self, params: &[Value]) -> Result<Value> {
+        let script_hash = hash_from_value(params.get(0))?;
+        // ask for one extra more than the limit and fail if it exists, to avoid silently truncating
+        let mempool_txids = self
+            .query
+            .mempool()
+            .history_txids(&script_hash[..], self.txs_limit + 1);
+        ensure!(mempool_txids.len() <= self.txs_limit, ErrorKind::TooPopular);
+
+        Ok(json!(mempool_txids
+            .into_iter()
+            .map(|txid| {
+                let fee = self.query.get_mempool_tx_fee(&txid);
+                let has_unconfirmed_parents = self.query.has_unconfirmed_parents(&txid);
+                // per the Electrum protocol: 0 if all inputs are confirmed, -1 otherwise
+                let height = if has_unconfirmed_parents { -1 } else { 0 };
+                GetHistoryResult { txid, height, fee }
+            })
+            .collect::<Vec<_>>()))
+    }
+
     fn blockchain_scripthash_listunspent(&self, params: &[Value]) -> Result<Value> {
         let script_hash = hash_from_value(params.get(0))?;
         let utxos = self.query.utxo(&script_hash[..])?;
@@ -517,6 +538,7 @@ impl Connection {
             #[cfg(not(feature = "liquid"))]
             "blockchain.scripthash.get_balance" => self.blockchain_scripthash_get_balance(&params),
             "blockchain.scripthash.get_history" => self.blockchain_scripthash_get_history(&params),
+            "blockchain.scripthash.get_mempool" => self.blockchain_scripthash_get_mempool(&params),
             "blockchain.scripthash.listunspent" => self.blockchain_scripthash_listunspent(&params),
             "blockchain.scripthash.subscribe" => self.blockchain_scripthash_subscribe(&params),
             "blockchain.scripthash.unsubscribe" => self.blockchain_scripthash_unsubscribe(&params),

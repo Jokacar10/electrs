@@ -264,6 +264,59 @@ fn test_electrum_jsonrpc_errors() {
     assert_eq!(s, expected);
 }
 
+/// Test blockchain.scripthash.get_mempool returns only the unconfirmed history of a scripthash
+#[cfg_attr(not(feature = "liquid"), test)]
+#[cfg_attr(feature = "liquid", allow(dead_code))]
+fn test_electrum_scripthash_get_mempool() -> Result<()> {
+    use bitcoin::hashes::{sha256, Hash};
+    use bitcoin::hex::DisplayHex;
+
+    let (_electrum_server, electrum_addr, mut tester) = common::init_electrum_tester()?;
+
+    let addr = tester.newaddress()?;
+
+    // Electrum protocol script hash: single SHA256 of the scriptPubKey, in reversed byte order
+    let mut hash = sha256::Hash::hash(addr.script_pubkey().as_bytes()).to_byte_array();
+    hash.reverse();
+    let scripthash = hash.to_lower_hex_string();
+
+    let request = |id: u32| {
+        format!(
+            "{{\"jsonrpc\": \"2.0\", \"method\": \"blockchain.scripthash.get_mempool\", \"params\": [\"{}\"], \"id\": {}}}",
+            scripthash, id
+        )
+    };
+
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+
+    // no mempool history yet
+    let s = write_and_read(&mut stream, &request(1));
+    assert_eq!(s, "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":[]}");
+
+    // an unconfirmed tx funding the address shows up (tester.send syncs the mempool index)
+    let txid = tester.send(&addr, "0.1 BTC".parse().unwrap())?;
+
+    let s = write_and_read(&mut stream, &request(2));
+    let v: electrumd::jsonrpc::serde_json::Value =
+        electrumd::jsonrpc::serde_json::from_str(&s).unwrap();
+    let entries = v["result"].as_array().expect("result array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0]["tx_hash"].as_str(),
+        Some(txid.to_string().as_str())
+    );
+    // height 0: all inputs confirmed (no unconfirmed parents)
+    assert_eq!(entries[0]["height"].as_i64(), Some(0));
+    assert!(entries[0]["fee"].as_u64().is_some());
+
+    // once confirmed, it no longer appears in the mempool result
+    tester.mine()?;
+    let s = write_and_read(&mut stream, &request(3));
+    assert_eq!(s, "{\"id\":3,\"jsonrpc\":\"2.0\",\"result\":[]}");
+
+    Ok(())
+}
+
 fn write_and_read(stream: &mut TcpStream, write: &str) -> String {
     stream.write_all(write.as_bytes()).unwrap();
     stream.write(b"\n").unwrap();
